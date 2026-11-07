@@ -1,7 +1,6 @@
 import 'dart:io';
 
 import 'package:analyzer/dart/analysis/features.dart';
-import 'package:analyzer/dart/analysis/results.dart';
 import 'package:analyzer/dart/analysis/utilities.dart';
 import 'package:analyzer/dart/ast/ast.dart';
 import 'package:analyzer/dart/ast/visitor.dart';
@@ -29,30 +28,57 @@ GoRouterParseResult parseGoRouterProject(String projectRoot) {
       .where((File file) => file.path.endsWith('.dart'))
       .map((File file) => file.path)
       .toList();
+  final Map<String, String> sources = <String, String>{
+    for (final String filePath in dartFiles)
+      filePath: File(filePath).readAsStringSync(),
+  };
+  final Map<String, CompilationUnit> units = <String, CompilationUnit>{};
+  CompilationUnit unitFor(String filePath) => units.putIfAbsent(
+        filePath,
+        () => parseString(
+          content: sources[filePath]!,
+          path: filePath,
+          featureSet: FeatureSet.latestLanguageVersion(),
+          throwIfDiagnostics: false,
+        ).unit,
+      );
+  final List<String> routeFiles = dartFiles
+      .where((String filePath) =>
+          sources[filePath]!.contains('GoRoute(') ||
+          sources[filePath]!.contains('RouteBase'))
+      .toList();
+  final List<String> constFiles = dartFiles
+      .where((String filePath) =>
+          RegExp(r'static\s+const').hasMatch(sources[filePath]!))
+      .toList();
   for (final String filePath in dartFiles) {
-    final String source = File(filePath).readAsStringSync();
+    final String source = sources[filePath]!;
     if (!source.contains('GoRouter(')) {
       continue;
     }
-    final ParseStringResult parseResult = parseString(
-      content: source,
-      path: filePath,
-      featureSet: FeatureSet.latestLanguageVersion(),
-      throwIfDiagnostics: false,
-    );
+    final CompilationUnit unit = unitFor(filePath);
     final _GoRouterCollector collector = _GoRouterCollector(
       projectRoot: projectRoot,
       filePath: filePath,
       source: source,
-      unit: parseResult.unit,
-      constStrings: ConstStringTable.fromUnit(parseResult.unit),
+      unit: unit,
+      constStrings: ConstStringTable.fromUnits(<CompilationUnit>[
+        unit,
+        for (final String other in constFiles)
+          if (other != filePath) unitFor(other),
+      ]),
+      routeUnits: <CompilationUnit>[
+        for (final String other in routeFiles)
+          if (other != filePath) unitFor(other),
+      ],
     );
-    parseResult.unit.visitChildren(collector);
+    unit.visitChildren(collector);
     if (collector.routes.isNotEmpty) {
       return GoRouterParseResult(
         routes: collector.routes,
         layouts: collector.layouts,
-        routerFile: p.relative(filePath, from: projectRoot).split(r'\').join('/'),
+        routerFile:
+            p.relative(filePath, from: projectRoot).split(r'\').join('/'),
       );
     }
   }
@@ -70,6 +96,7 @@ class _GoRouterCollector extends RecursiveAstVisitor<void> {
     required this.source,
     required this.unit,
     required this.constStrings,
+    this.routeUnits = const <CompilationUnit>[],
   });
 
   final String projectRoot;
@@ -77,6 +104,7 @@ class _GoRouterCollector extends RecursiveAstVisitor<void> {
   final String source;
   final CompilationUnit unit;
   final ConstStringTable constStrings;
+  final List<CompilationUnit> routeUnits;
   final List<RouteNode> routes = <RouteNode>[];
   final List<LayoutNode> layouts = <LayoutNode>[];
 
@@ -90,7 +118,9 @@ class _GoRouterCollector extends RecursiveAstVisitor<void> {
   @override
   void visitMethodInvocation(MethodInvocation node) {
     final String name = node.methodName.name;
-    if (name == 'GoRouter' || name == 'GoRoute' || name == 'ShellRoute' ||
+    if (name == 'GoRouter' ||
+        name == 'GoRoute' ||
+        name == 'ShellRoute' ||
         name == 'StatefulShellRoute') {
       _maybeCollectGoRouter(name, node.argumentList);
     }
@@ -133,10 +163,8 @@ class _GoRouterCollector extends RecursiveAstVisitor<void> {
       if (call.name == 'ShellRoute' || call.name == 'StatefulShellRoute') {
         final String navigator =
             call.name == 'StatefulShellRoute' ? 'tabs' : 'shell';
-        final String layoutFile = p
-            .relative(filePath, from: projectRoot)
-            .split(r'\')
-            .join('/');
+        final String layoutFile =
+            p.relative(filePath, from: projectRoot).split(r'\').join('/');
         layouts.add(
           LayoutNode(
             file: layoutFile,
@@ -206,11 +234,49 @@ class _GoRouterCollector extends RecursiveAstVisitor<void> {
     if (expression is PrefixedIdentifier) {
       return _lookupTopLevelList(expression.identifier.name);
     }
+    if (expression is PropertyAccess) {
+      return _lookupTopLevelList(expression.propertyName.name);
+    }
+    if (expression is MethodInvocation) {
+      return _lookupTopLevelList(expression.methodName.name);
+    }
     return null;
   }
 
   Expression? _lookupTopLevelList(String name) {
+    return _lookupInUnit(unit, name, includeClassMembers: true) ??
+        routeUnits
+            .map((CompilationUnit other) => _lookupInUnit(other, name))
+            .whereType<Expression>()
+            .firstOrNull;
+  }
+
+  Expression? _lookupInUnit(
+    CompilationUnit unit,
+    String name, {
+    bool includeClassMembers = false,
+  }) {
     for (final CompilationUnitMember member in unit.declarations) {
+      if (includeClassMembers && member is ClassDeclaration) {
+        for (final ClassMember classMember in member.members) {
+          if (classMember is MethodDeclaration &&
+              classMember.name.lexeme == name) {
+            final Expression? returned = _returnedExpression(classMember.body);
+            if (returned != null) {
+              return returned;
+            }
+          }
+          if (classMember is FieldDeclaration) {
+            for (final VariableDeclaration variable
+                in classMember.fields.variables) {
+              if (variable.name.lexeme == name &&
+                  variable.initializer != null) {
+                return variable.initializer;
+              }
+            }
+          }
+        }
+      }
       if (member is FunctionDeclaration && member.name.lexeme == name) {
         final FunctionBody body = member.functionExpression.body;
         if (body is ExpressionFunctionBody) {
@@ -235,8 +301,23 @@ class _GoRouterCollector extends RecursiveAstVisitor<void> {
     return null;
   }
 
+  Expression? _returnedExpression(FunctionBody body) {
+    if (body is ExpressionFunctionBody) {
+      return body.expression;
+    }
+    if (body is BlockFunctionBody) {
+      for (final Statement statement in body.block.statements) {
+        if (statement is ReturnStatement) {
+          return statement.expression;
+        }
+      }
+    }
+    return null;
+  }
+
   void _walkBranches(Expression expression, {required String parentPath}) {
-    final ListLiteral? list = _asList(expression);
+    final ListLiteral? list =
+        _asList(_resolveRoutesExpression(expression) ?? expression);
     if (list == null) {
       return;
     }
@@ -347,13 +428,23 @@ _RouteCall? _asRouteCall(Expression expression) {
     );
   }
   if (expression is MethodInvocation) {
+    final Expression? target = expression.target;
+    final bool namedConstructor =
+        target is SimpleIdentifier && _routeTypeNames.contains(target.name);
     return _RouteCall(
-      name: expression.methodName.name,
+      name: namedConstructor ? target.name : expression.methodName.name,
       argumentList: expression.argumentList,
     );
   }
   return null;
 }
+
+const Set<String> _routeTypeNames = <String>{
+  'GoRoute',
+  'ShellRoute',
+  'StatefulShellRoute',
+  'StatefulShellBranch',
+};
 
 ListLiteral? _asList(Expression expression) {
   if (expression is ListLiteral) {
