@@ -6,9 +6,14 @@ class ConstStringTable {
 
   final Map<String, String> _values;
 
-  static ConstStringTable fromUnit(CompilationUnit unit) {
+  static ConstStringTable fromUnit(CompilationUnit unit) =>
+      fromUnits(<CompilationUnit>[unit]);
+
+  /// Merges constants from several units; earlier units win on bare names.
+  static ConstStringTable fromUnits(Iterable<CompilationUnit> units) {
     final Map<String, Expression> pending = <String, Expression>{};
-    for (final CompilationUnitMember member in unit.declarations) {
+    for (final CompilationUnitMember member
+        in units.expand((CompilationUnit unit) => unit.declarations)) {
       if (member is TopLevelVariableDeclaration) {
         _collectVariables(
           member.variables,
